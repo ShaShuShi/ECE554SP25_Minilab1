@@ -8,12 +8,12 @@ module mem_wrapper (
     input wire read,                // Read request
     output reg [63:0] readdata,     // 64-bit read data (one row)
     output reg readdatavalid,       // Data valid signal
-	output reg waitrequest          // Busy signal to indicate logic is processing
+	 output reg waitrequest          // Busy signal to indicate logic is processing
 );
 
     wire [63:0] mem_rdata;
     reg [4:0] read_address;  // Latched address for the read operation
-	reg [3:0] delay_counter; // Counter for variable delay
+	 reg [3:0] delay_counter; // Counter for variable delay
 
     // State machine for variable delay
     reg [1:0] state;
@@ -33,7 +33,7 @@ module mem_wrapper (
             state <= IDLE;
             readdatavalid <= 1'b0;
             readdata <= 64'b0;
-			waitrequest <= 1'b0;
+			   waitrequest <= 1'b0;
             delay_counter <= 4'b0;
         end else begin
             case (state)
@@ -42,7 +42,7 @@ module mem_wrapper (
 						  waitrequest <= 1'b0;
                     if (read) begin
                         read_address <= address; // Latch the address
-						delay_counter <= 4'b1010; // Set a delay (e.g., 10 cycles)
+						      delay_counter <= 4'b1010; // Set a delay (e.g., 10 cycles)
                         waitrequest <= 1'b1;
                         state <= WAIT; // Introduce a wait state
                     end
@@ -57,7 +57,7 @@ module mem_wrapper (
                 RESPOND: begin
                     readdata <= mem_rdata;
                     readdatavalid <= 1'b1; // Indicate valid data
-					waitrequest <= 1'b0;
+					     waitrequest <= 1'b0;
                     state <= IDLE; // Return to IDLE state
                 end
             endcase

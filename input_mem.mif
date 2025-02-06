@@ -7,8 +7,8 @@ DATA_RADIX=HEX;
 
 CONTENT -- start of (address : data pairs)
 BEGIN
-    0 : 0102030405060708; -- B
-    1 : 1112131415161718; -- A starts here
+    0 : 0102030405060708; -- memory address : data 
+    1 : 1112131415161718;
     2 : 2122232425262728;
     3 : 3132333435363738;
     4 : 4142434445464748;

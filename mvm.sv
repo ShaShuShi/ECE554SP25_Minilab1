@@ -1,157 +1,344 @@
 module MVM #(
-	parameter DATA_WIDTH = 8
-	parameter ARR_WIDTH = 8
-	parameter DEPTH = 8
+  parameter DATA_WIDTH = 8,
+  parameter NUM_MAC    = 8,  // Number of MAC units (also number of A FIFO rows)
+  parameter DEPTH      = 8   // Memory row depth per FIFO
 )(
-	input clk,
-	input rst_n,
-	input [DATA_WIDTH - 1:0]En,
-	input Clr,
-	input [DATA_WIDTH-1:0] B [DEPTH-1:0],
-	input reg [DATA_WIDTH - 1:0]a[ARR_WIDTH-1:0][DEPTH - 1:0], //Data width * array width - 1
-	output [DATA_WIDTH-1:0]result
+  input  logic         clk,
+  input  logic         rst_n,
+  input  logic         Clr,
+  // Final results from each MAC as a single flattened bus
+  output logic [(NUM_MAC*DATA_WIDTH*3)-1:0] result
 );
 
-localparam READ_MEM = 2'd0;
-localparam FILL = 2'd1;
-localparam EXEC = 2'd2;
-localparam DONE = 2'd3;
+  // Internal storage for final results (2D array style)
+  logic [DATA_WIDTH*3-1:0] result_ff [NUM_MAC-1:0];
 
+  //=====================================================================
+  // ROM (mem_wrapper) Interface
+  //=====================================================================
+  reg  [31:0] address_index;  // Each address yields one 64-bit word
+  reg         read_mem;
+  wire        mem_valid;
+  wire        mem_wait_request;
+  wire [63:0] read_data_mem;
+  
+  mem_wrapper mem_inst (
+    .clk           (clk),
+    .reset_n       (rst_n),
+    .address       (address_index[3:0]),
+    .read          (read_mem),
+    .readdata      (read_data_mem),
+    .readdatavalid (mem_valid),
+    .waitrequest   (mem_wait_request)
+  );
 
-//=======================================================
-//  REG/WIRE declarations
-//=======================================================
-
-reg [1:0] state;
-wire rst_n;
-
-
-reg [31:0] address_index;
-reg read_mem, mem_valid, mem_wait_request;
-reg [63:0] read_data_mem;
-mem_wrapper (
-    .clk(clk),
-    .reset_n(rst_n),
-    .address(address_index),      // 32-bit address for 8 rows
-    .read(read_mem),                // Read request
-    .readdata(read_data_mem),     // 64-bit read data (one row)
-    .readdatavalid(mem_valid),       // Data valid signal
-    .waitrequest(mem_wait_request)          // Busy signal to indicate logic is processing
-);
-
-reg a_in, a_out [7:0]; //Loop through read_data_mem 8 times for each fifo. a_out only should be used once all fifos are filled. 
-wire [7:0] full_a, empty_a, wren_a, rden_a;
-FIFO iFa[7:0](
-  .clk(clk),
-  .rst_n(rst_n),
-  .rden(rden_a),
-  .wren(wren_a),
-  .i_data(a_in),
-  .o_data(a_out),
-  .full(full_a),
-  .empty(empty_a)
-);
-reg b_in, b_out [7:0]; // Loop through B to fill this fifo.
-wire full_b, empty_b;
-FIFO iFb(
-  .clk(clk),
-  .rst_n(rst_n),
-  .rden(rden_b),
-  .wren(wren),
-  .i_data(b),
-  .o_data(b_out),
-  .full(full_b),
-  .empty(empty_b)
-);
-
-reg [7:0] en;
-wire [DATA_WIDTH*3-1:0] macout [7:0];
-MAC iMAC[7:0] (
-    .clk(clk),
-    .rst_n(clk),
-    .En(en),
-    .Clr(Clr),
-    .Ain(a_out),
-    .Bin(b_out,
-    .Cout(macout)
-
-);
-
-//=======================================================
-//  Structural coding
-//=======================================================
-
-assign rst_n = KEY[0];
-assign wren[0] = state == FILL;
-assign wren[1] = wren[0];
-assign rden[0] = state == EXEC;
-assign rden[1] = rden[0];
-
-integer j, i;
-
-always @(posedge clk or negedge rst_n) begin
-  if (~rst_n) begin
-    state <= READ_MEM;
-	address_index = 32'h0000;
-	read_mem = 1'b0;
-	 for (j=0; j<8; j=j+1) begin
-	   Cout[j] <= {(DATA_WIDTH*3){1'b0}};
-	 end
-	   b_in <= {DATA_WIDTH{1'b0}};
-	 for (j=0; j<8; j=j+1) begin
-	   a_in[j] <= {DATA_WIDTH{1'b0}};
-	 end
+  //=====================================================================
+  // FIFOs for Matrix A Data (unchanged except indexing later)
+  //=====================================================================
+  logic [DATA_WIDTH-1:0] fifoA_data_in [NUM_MAC-1:0];
+  logic                  fifoA_wren    [NUM_MAC-1:0];
+  logic                  fifoA_rden    [NUM_MAC-1:0];
+  logic [DATA_WIDTH-1:0] fifoA_out     [NUM_MAC-1:0];
+  wire                   fifoA_full    [NUM_MAC-1:0];
+  wire                   fifoA_empty   [NUM_MAC-1:0];
+  
+  genvar i;
+  generate
+    for(i = 0; i < NUM_MAC; i = i + 1) begin : A_FIFOs
+      FIFO #(
+        .DEPTH(DEPTH),
+        .DATA_WIDTH(DATA_WIDTH)
+      ) fifo_inst (
+        .clk    (clk),
+        .rst_n  (rst_n),
+        .rden   (fifoA_rden[i]),
+        .wren   (fifoA_wren[i]),
+        .i_data (fifoA_data_in[i]),
+        .o_data (fifoA_out[i]),
+        .full   (fifoA_full[i]),
+        .empty  (fifoA_empty[i])
+      );
+    end
+  endgenerate
+  
+  //=====================================================================
+  // FIFO for Vector B Data (B now comes from memory)
+  //=====================================================================
+  logic [DATA_WIDTH-1:0] fifoB_data_in;
+  logic                  fifoB_wren;
+  logic                  fifoB_rden;
+  wire [DATA_WIDTH-1:0]  fifoB_out;
+  wire                   fifoB_full;
+  wire                   fifoB_empty;
+  
+  FIFO #(
+    .DEPTH(DEPTH),
+    .DATA_WIDTH(DATA_WIDTH)
+  ) fifoB (
+    .clk   (clk),
+    .rst_n (rst_n),
+    .rden  (fifoB_rden),
+    .wren  (fifoB_wren),
+    .i_data(fifoB_data_in),
+    .o_data(fifoB_out),
+    .full  (fifoB_full),
+    .empty (fifoB_empty)
+  );
+  
+  // A counter to step through the 8 bytes of the current row.
+  reg [2:0] byte_counter;  // Counts from 0 to 7
+  
+  //=====================================================================
+  // Main State Machine: INIT --> FILL --> EXEC --> DONE
+  //=====================================================================
+  typedef enum logic [1:0] {INIT, FILL, EXEC, DONE} state_t;
+  state_t state, next_state;
+  
+  // Global enable (asserted when FIFOs are loaded)
+  reg global_en;
+  reg shift_start;
+  logic disable_read;
+  
+  //=====================================================================
+  // Pipelined Enable and B Propagation 
+  //=====================================================================
+  logic en_pipeline [NUM_MAC-1:0];
+  logic [3:0] add_count [NUM_MAC - 1:0];
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      en_pipeline[0] <= 0;
+      for (int m = 1; m < NUM_MAC; m = m + 1) begin
+        en_pipeline[m-1] <= 0;
+        add_count[m-1]  <= 4'b0000;
+      end
+    end else if (state == EXEC) begin
+      if(add_count[0] < 4'b1000) begin
+        en_pipeline[0] <= global_en;
+      end
+      for (int m = 1; m < NUM_MAC; m = m + 1) begin
+        en_pipeline[m] <= en_pipeline[m-1];
+        if(en_pipeline[m-1]) begin
+          add_count[m-1] <= add_count[m-1] + 1'b1;
+          if(add_count[m-1] > 3'b111) begin
+            en_pipeline[m-1] <= 0;
+          end
+        end
+      end
+    end else begin
+      for (int m = 0; m < NUM_MAC; m = m + 1)
+        en_pipeline[m] <= 0;
+    end
   end
-  else begin
-    case(state)
-	   READ_MEM: 
-		begin 
-		read_mem <= 1'b1;
-		if (mem_valid & ~mem_wait_request) //done reading from mem
-		  state <= FILL:
-	   FILL:
-		begin
-		if (full[7]) begin //last fifo has been filled
-		    state <= EXEC;
-		end
-		else if (full[address_index / 64 -1]) begin
-		    address_index <= address_index + 64;
-		    state <= READ_MEM;
-		end 
-		  else begin
-		  	// Memory needs to be loaded and stored in the fifos reg [31:0] address_index; reg read_mem, mem_valid, mem_wait_request; reg [63:0] read_data_mem;
-			a_in[7:0] = read_data_mem[i:i+ 7];
-			b_in[7:0] = 
-			i++;
-			wren_a[address_index / 64 -1] = 1'b1;
-		  end
-	   end	
-		EXEC:
-		begin
-		  if (empty) begin
-		    state <= DONE;
-		  end
-		end
-		DONE:
-		begin
-		  result <= macout;
-		end
-	 endcase
+  
+  // The b_pipeline now gets its input from the B FIFO (loaded from memory row 0).
+  logic [DATA_WIDTH-1:0] b_pipeline [NUM_MAC-1:0];
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      b_pipeline[0] <= 0;
+      for (int m = 1; m < NUM_MAC; m = m + 1)
+        b_pipeline[m] <= 0;
+    end else if (state == EXEC) begin
+      b_pipeline[0] <= fifoB_out;
+      for (int m = 1; m < NUM_MAC; m = m + 1)
+        b_pipeline[m] <= b_pipeline[m-1];
+    end else begin
+      for (int m = 0; m < NUM_MAC; m = m + 1)
+        b_pipeline[m] <= 0;
+    end
   end
-end
+  
+  //-------------------------------------------------------------------------
+  // FILL State: Buffering and Shifting out Bytes into FIFOs
+  //-------------------------------------------------------------------------
+  // In this state, the memory words are captured into a double buffer.
+  // The bytes of the current row are shifted out to either the B FIFO
+  // (for address_index==0) or the A FIFOs (for address_index 1..NUM_MAC).
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      state         <= INIT;
+      address_index <= 0;
+      byte_counter  <= 0;
+      global_en     <= 0;
+      // Initialize FIFO enables
+      for (int j = 0; j < NUM_MAC; j = j + 1) begin
+        fifoA_wren[j] <= 0;
+        fifoA_rden[j] <= 0;
+      end
+      fifoB_wren <= 0;
+      fifoB_rden <= 0;
+    end else begin
+      state <= next_state;
+      case (state)
+        //---------------------------------------------------------------------
+        // INIT: Begin memory read.
+        //---------------------------------------------------------------------
+        INIT: begin
+          read_mem <= 1;
+          disable_read <= 0;
+        end
 
+        //---------------------------------------------------------------------
+        // FILL: Load FIFOs from Memory via Buffered Rows.
+        //---------------------------------------------------------------------
+        FILL: begin
+          if (~disable_read) begin
+            read_mem <= 0;
+            disable_read <= 1;
+          end
+          if (mem_valid & ~mem_wait_request) begin
+            shift_start <= 1;
+            read_mem <= 0;
+          end
+          if (shift_start) begin
+            if (address_index == 0 & ~fifoB_full) begin
+              fifoB_data_in <= read_data_mem[byte_counter*8 +: 8];
+              fifoB_wren    <= 1;
+              read_mem      <= 0;
+            end else begin
+              // For addresses 1 to NUM_MAC, load A FIFOs.
+              // The index for the A FIFOs is (address_index - 1).
+              fifoB_wren    <= 0;
+              fifoA_data_in[address_index-1] <= read_data_mem[byte_counter*8 +: 8];
+              fifoA_wren[address_index-1]    <= 1;
+              read_mem      <= 0;
+            end
+            // Advance byte counter.
+            if (byte_counter == 7) begin
+              byte_counter  <= 0;
+              address_index <= address_index + 1;
+              read_mem      <= 1;
+              shift_start   <= 0;
+            end else begin
+              byte_counter <= byte_counter + 1;
+              read_mem     <= 0;
+            end
+            if (address_index == 0) begin
+              fifoB_wren <= 1;
+            end
+          end else if (byte_counter != 7) begin
+            read_mem <= 0;
+          end
 
+          // Disable reading from the B FIFO during FILL.
+          fifoB_rden <= 0;
+        end
 
-always_ff @(posedge clk, rst_n) begin
+        //---------------------------------------------------------------------
+        // EXEC: FIFOs are loaded. Stop memory reads and enable FIFO reads.
+        //---------------------------------------------------------------------
+        EXEC: begin
+          // Initialize FIFO enables
+          for (int j = 0; j < NUM_MAC; j = j + 1) begin
+            fifoA_wren[j] <= 0;
+          end
+          fifoB_wren <= 0;
 
-end
+          // Stop further memory reads.
+          global_en <= 1;
+          read_mem  <= 0;
+          // Read FIFO A with the same relative delay as the B pipeline:
+          // FIFO 0 gets the ?immediate? data, and FIFO k (for k>=1)
+          // is read one cycle later.
+          fifoA_rden[0] <= global_en;
+          for (int k = 1; k < NUM_MAC; k = k + 1) begin
+            fifoA_rden[k] <= en_pipeline[k-1];
+          end
+          // Enable reading from the B FIFO.
+          fifoB_rden <= 1;
+        end
 
+        //---------------------------------------------------------------------
+        // DONE: Processing complete. Stop FIFO reads.
+        //---------------------------------------------------------------------
+        DONE: begin
+          global_en <= 0;
+          for (int k = 0; k < NUM_MAC; k = k + 1)
+            fifoA_rden[k] <= 0;
+          fifoB_rden <= 0;
+        end
 
+        default: begin
+          global_en <= 0;
+        end
+      endcase
+    end
+  end
+  
+  //=====================================================================
+  // Next-State Logic
+  //=====================================================================
+  always_comb begin
+    next_state = state;
+    case (state)
+      INIT: begin
+        if (read_mem)
+          next_state = FILL;
+      end
+      FILL: begin
+        // We have loaded one row for B (address_index==0) plus NUM_MAC rows for A.
+        if (&{fifoA_full[0], fifoA_full[1], fifoA_full[2], fifoA_full[3],
+              fifoA_full[4], fifoA_full[5], fifoA_full[6], fifoA_full[7]})
+          next_state = EXEC;
+        else
+          next_state = FILL;
+      end
+      EXEC: begin
+        // When all A FIFOs become empty, processing is complete.
+        if (&{fifoA_empty[0], fifoA_empty[1], fifoA_empty[2], fifoA_empty[3],
+              fifoA_empty[4], fifoA_empty[5], fifoA_empty[6], fifoA_empty[7]})
+          next_state = DONE;
+        else
+          next_state = EXEC;
+      end
+      DONE: begin
+        next_state = DONE;
+      end
+      default: next_state = FILL;
+    endcase
+  end
+  
+  //=====================================================================
+  // MAC Array Instantiation 
+  //=====================================================================
+  logic [DATA_WIDTH*3-1:0] mac_out [NUM_MAC-1:0];
+  
+  genvar j;
+  generate
+    for (j = 0; j < NUM_MAC; j = j + 1) begin : MAC_ARRAY
+      MAC #(
+        .DATA_WIDTH(DATA_WIDTH)
+      ) mac_inst (
+        .clk   (clk),
+        .rst_n (rst_n),
+        .En    (en_pipeline[j]),
+        .Clr   (Clr),
+        .Ain   (fifoA_out[j]),
+        .Bin   (b_pipeline[j]),
+        .Cout  (mac_out[j])
+      );
+    end
+  endgenerate
+  
+  //=====================================================================
+  // Capture/Output Final Results
+  //=====================================================================
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      for (int k = 0; k < NUM_MAC; k = k + 1)
+        result_ff[k] <= '0;
+    end else if (state == DONE) begin
+      for (int k = 0; k < NUM_MAC; k = k + 1)
+        result_ff[k] <= mac_out[k];
+    end
+  end
 
+  // Flatten the 2D result_ff array into the 1D output "result".
+  // Each MAC result occupies DATA_WIDTH*3 bits in the output.
+  always_comb begin
+    for (int k = 0; k < NUM_MAC; k = k + 1) begin
+      result[k*DATA_WIDTH*3 +: DATA_WIDTH*3] = result_ff[k];
+    end
+  end
 
+endmodule
 
-
-
-
-
-endmodule 
